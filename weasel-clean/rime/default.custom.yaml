@@ -1,0 +1,36 @@
+# scel2rime / weasel-clean
+#
+# 全局补丁：只管"用起来顺手"，不引入任何插件、皮肤商店、云候选或在线服务。
+# 覆盖到 %APPDATA%\Rime\default.custom.yaml 后重新部署。
+
+patch:
+  schema_list:
+    - schema: luna_pinyin_simp
+
+  # 候选个数。9 个是竖排 3×3 和横排都不挤的折中值。
+  menu/page_size: 9
+
+  # 中英切换：Shift 上屏当前编码后再切，避免"想切英文却把拼音打出来"。
+  ascii_composer/good_old_caps_lock: true
+  ascii_composer/switch_key:
+    Caps_Lock: clear
+    Shift_L: commit_code
+    Shift_R: commit_code
+    Control_L: noop
+    Control_R: noop
+
+  # 光标键在候选窗里的行为，和其它输入法保持一致。
+  key_binder/bindings:
+    - { when: composing, accept: Control+p, send: Up }
+    - { when: composing, accept: Control+n, send: Down }
+    - { when: composing, accept: Control+b, send: Left }
+    - { when: composing, accept: Control+f, send: Right }
+    - { when: composing, accept: Control+h, send: BackSpace }
+    - { when: composing, accept: Control+d, send: Delete }
+    - { when: paging, accept: minus, send: Page_Up }
+    - { when: has_menu, accept: equal, send: Page_Down }
+    - { when: always, accept: Control+Shift+space, toggle: full_shape }
+    - { when: always, accept: Control+Shift+4, toggle: simplification }
+
+  # 默认中文，且默认输出简体。
+  switches/@0/reset: 1

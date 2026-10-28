@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.vscode/
+.idea/
+out/
+rime-dicts/
+*.dict.yaml
+!tests/fixtures/*.dict.yaml
+.DS_Store
+Thumbs.db

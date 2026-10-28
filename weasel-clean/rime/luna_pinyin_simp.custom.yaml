@@ -1,0 +1,20 @@
+# scel2rime / weasel-clean
+#
+# 拼音方案补丁：把词典换成 scel_merged（由 install.ps1 生成，聚合
+# luna_pinyin_simp 与你自己迁移过来的词库），其余保持官方行为。
+#
+# 没有云端候选、没有联想服务、没有皮肤包——librime 本身就没有这些，
+# 这份补丁只是不去打开任何可选开关。
+
+patch:
+  translator/dictionary: scel_merged
+  translator/enable_user_dict: true
+  translator/enable_completion: true
+  translator/enable_sentence: true
+  translator/spelling_hints: 0
+  translator/preedit_format: []
+
+  # 用户词库与调频：本地文件，不参与任何同步。
+  "translator/contextual_suggestions": false
+  "translator/max_homophones": 8
+  "translator/max_homographs": 8

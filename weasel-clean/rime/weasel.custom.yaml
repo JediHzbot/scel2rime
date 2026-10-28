@@ -1,0 +1,39 @@
+# scel2rime / weasel-clean
+#
+# 外观补丁：一套纯色配色，代替官方那套会拉取皮肤的思路。
+# 覆盖到 %APPDATA%\Rime\weasel.custom.yaml 后重新部署。
+
+patch:
+  style/color_scheme: clean
+  style/font_face: "Microsoft YaHei UI"
+  style/font_point: 14
+  style/label_format: "%c"
+  style/candidate_format: "%c  %@"
+  style/horizontal: true
+  style/inline_preedit: true
+  style/comment_font_point: 12
+  style/base_offset: 0
+  style/layout/margin_x: 10
+  style/layout/margin_y: 8
+  style/layout/spacing: 12
+  style/layout/candidate_spacing: 18
+  style/layout/hilite_padding: 4
+  style/layout/hilite_spacing: 4
+  style/layout/round_corner: 4
+  style/layout/border_height: 1
+
+  preset_color_schemes/clean:
+    name: "干净"
+    author: "scel2rime"
+    # Rime 颜色按 ABGR 排列：0xAABBGGRR
+    back_color: 0xFFFFFF
+    border_color: 0xD8D8D8
+    text_color: 0x222222
+    hilited_text_color: 0x000000
+    hilited_back_color: 0xEAF0FB
+    candidate_text_color: 0x333333
+    hilited_candidate_text_color: 0x0A0A0A
+    hilited_candidate_back_color: 0xD6E4FF
+    comment_text_color: 0x8A8A8A
+    label_color: 0x9A9A9A
+    hilited_label_color: 0x2E5AAC
