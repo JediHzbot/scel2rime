@@ -1,4 +1,4 @@
-﻿# scel2rime
+# scel2rime
 
 > 换输入法最贵的成本不是重背键位，是十年的词库带不走。
 
@@ -100,22 +100,32 @@ columns:
 上行链路	shang xing lian lu	800
 ```
 
-在输入方案里启用，编辑 `luna_pinyin.custom.yaml`：
+在方案里启用。别去改官方的 `luna_pinyin.dict.yaml`（它在 Program Files 里，会被升级覆盖），建一个聚合词典放进 Rime 用户目录：
 
 ```yaml
-patch:
-  "translator/dictionary": luna_pinyin
-```
-
-再在 `luna_pinyin.dict.yaml` 的 `import_tables` 里加一行词典名（不带扩展名）：
-
-```yaml
+# my_dict.dict.yaml   ← name 必须和文件名一致
+---
+name: my_dict
+version: "1"
+sort: by_weight
+use_preset_vocabulary: true
 import_tables:
   - luna_pinyin
   - 行业词库
+...
 ```
 
-重新部署，词库就进来了。
+再让方案指向它：
+
+```yaml
+# luna_pinyin_simp.custom.yaml
+patch:
+  translator/dictionary: my_dict
+```
+
+然后部署。注意 `import_tables` 里写的是**词典名**（不带 `.dict.yaml`），官方自带词典只有 `luna_pinyin`、`cangjie5`、`stroke`、`terra_pinyin` 四个——`luna_pinyin_simp` 是方案名，不是词典名，写进去会报 `source file ... does not exist`。
+
+这一步用 `weasel-clean/install.ps1` 的话是自动完成的。
 
 ## 拼音为什么能直接用
 
@@ -155,10 +165,10 @@ Rime 走 UTF-8 路径，中文名正常。若你的某个 librime 版本不认�
 
 ```powershell
 cd weasel-clean
-.\install.ps1 -From ..\rime-dicts
+.\install.ps1 -From ..\rime-dicts -Deploy
 ```
 
-它会备份现有配置、写入三份 YAML 补丁、把迁移过来的词库聚合进 `luna_pinyin_simp`，然后等你重新部署。
+它会备份现有配置、写入三份 YAML 补丁、把迁移过来的词库聚合进官方 `luna_pinyin` 词典，然后用 `deploy.ps1` 直接调 librime 完成部署——不依赖 Weasel 那个在部分机器上会卡死的部署器，并检查编译产物是否真的生成。
 
 装完是：候选数 9、Shift 切英文先上屏、纯色配色、横排内嵌编码、本地用户词库。没有皮肤商店、云端候选、内嵌浏览器、AI 联想——这些不是被关掉的开关，是 librime 本来就没有的东西。
 

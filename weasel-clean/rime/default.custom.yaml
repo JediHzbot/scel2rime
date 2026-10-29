@@ -30,7 +30,9 @@ patch:
     - { when: paging, accept: minus, send: Page_Up }
     - { when: has_menu, accept: equal, send: Page_Down }
     - { when: always, accept: Control+Shift+space, toggle: full_shape }
-    - { when: always, accept: Control+Shift+4, toggle: simplification }
+    # 这个方案的简繁开关叫 zh_simp，不是 simplification——
+    # librime 默认绑定的是 simplification，名字对不上按键就是空转。
+    - { when: always, accept: Control+Shift+4, toggle: zh_simp }
 
-  # 默认中文，且默认输出简体。
-  switches/@0/reset: 1
+  # 故意不覆盖 switches/@0/reset：第 0 个开关是 ascii_mode，
+  # 设成 1 会让输入法默认停在英文模式。方案默认值 0（中文）就是想要的。

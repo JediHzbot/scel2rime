@@ -13,3 +13,4 @@ rime-dicts/
 !tests/fixtures/*.dict.yaml
 .DS_Store
 Thumbs.db
+.tmp/

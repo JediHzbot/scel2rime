@@ -16,8 +16,8 @@
 # 只装配置
 .\install.ps1
 
-# 连同 scel2rime 迁移过来的词库一起装
-.\install.ps1 -From ..\rime-dicts
+# 连同 scel2rime 迁移过来的词库一起装，并立刻部署
+.\install.ps1 -From ..\rime-dicts -Deploy
 
 # 先看看会改什么
 .\install.ps1 -From ..\rime-dicts -DryRun
@@ -28,9 +28,37 @@
 1. 把现有配置备份到 `%APPDATA%\Rime\backup-scel2rime-<时间戳>\`
 2. 写入三份 `.custom.yaml` 补丁
 3. 复制 `-From` 目录里的 `.dict.yaml`，并登记词典名
-4. 生成 `scel_merged.dict.yaml`，把 `luna_pinyin_simp` 和你的词库聚合到一起
+4. 生成 `scel_merged.dict.yaml`，把官方 `luna_pinyin` 词典和你的词库聚合到一起
 
-然后重新部署：右键任务栏输入法图标 → 重新部署。
+加 `-Deploy` 会顺手把部署也跑掉，并检查 `build\scel_merged.table.bin` 有没有真的生成。
+
+## 部署这一步为什么要单独写
+
+`WeaselDeployer.exe /deploy` 做的事只是**给 WeaselServer 服务发消息**，真正的编译发生在服务里。在部分安装上（本项目实测 Weasel 0.17.4 + librime 1.13.1）那个部署线程起不来：命令返回、日志停在"加载 schema"之后就没了，`build\` 里一个文件都不更新。表面上"部署成功"，实际什么都没变——这是最难查的一类故障，因为配置文件看着完全正确。
+
+`deploy.ps1` 绕过服务，直接调 `rime.dll`：
+
+```
+RimeSetup -> RimeInitialize -> RimeStartMaintenance(full) -> Finalize
+```
+
+它按 [rime_api.h](https://github.com/rime/librime/blob/master/src/rime_api.h) 里的字段顺序构造 `RimeTraits`。这里有两个坑，都踩过：
+
+- `data_size` 必须是 `sizeof(Traits) - 4`。漏了它，librime 会把第一个字段的指针当成尺寸，**整份 traits 被忽略**，回退到进程工作目录——看起来部署成功，其实编译到了别的地方。
+- 字段顺序是 `... distribution_version, app_name, modules, min_log_level, log_dir, ...`。中间多塞一个不存在的字段，`RimeInitialize` 直接访问违例。
+
+单独用：
+
+```powershell
+.\deploy.ps1 -FullCheck     # 强制全量重建
+.\deploy.ps1                # 增量
+```
+
+**验证部署是否真的生效**，看时间戳，不要看返回码：
+
+```powershell
+Get-ChildItem "$env:APPDATA\Rime\build\*.table.bin" | Select Name, LastWriteTime
+```
 
 ## 装了什么
 
