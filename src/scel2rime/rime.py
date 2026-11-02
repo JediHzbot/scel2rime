@@ -17,6 +17,9 @@ inside this dictionary, and `--scale 1` restores the raw grade.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import tempfile
 import re
 from pathlib import Path
 
@@ -36,6 +39,8 @@ def sanitize_name(candidate: str, fallback: str = "sogou_dict") -> str:
     """Turn an arbitrary dictionary name into a usable Rime dictionary id."""
     cleaned = _NAME_UNSAFE.sub("_", candidate.strip())
     cleaned = _WHITESPACE.sub("_", cleaned).strip("._ ")
+    if cleaned.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(1, 10)], *[f"LPT{i}" for i in range(1, 10)]}:
+        cleaned = "dict_" + cleaned
     return cleaned or fallback
 
 
@@ -55,6 +60,13 @@ def name_for(dictionary: ScelDictionary, index: int = 0, override: str | None = 
             return cleaned
     digest = hashlib.sha1(f"{dictionary.name}|{dictionary.path.name}".encode("utf-8")).hexdigest()[:8]
     return f"sogou_{digest}"
+
+
+def yaml_scalar(value: str) -> str:
+    """Keep ordinary ids readable; quote anything ambiguous to YAML."""
+    if re.fullmatch(r"[A-Za-z_\u3400-\u9fff][\w.-]*", value) and value.lower() not in {"true", "false", "null", "yes", "no", "on", "off"}:
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
 def dedupe(entries: list[WordEntry]) -> list[WordEntry]:
@@ -109,7 +121,7 @@ def render(
         [
             "",
             "---",
-            f"name: {name}",
+            "name: " + yaml_scalar(name),
             'version: "1"',
             f"sort: {'by_weight' if sort_by_weight else 'original'}",
             "use_preset_vocabulary: true",
@@ -138,5 +150,16 @@ def write(
     """Write one dictionary to `destination` and return the path."""
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(render(dictionary, name, **options), encoding="utf-8")
+    text = render(dictionary, name, **options)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=destination.parent, prefix=".scel2rime-", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return destination

@@ -10,6 +10,8 @@ Three verbs, all offline:
 from __future__ import annotations
 
 import argparse
+import json
+from collections import Counter
 import os
 import sys
 from pathlib import Path
@@ -18,12 +20,15 @@ from . import __version__, rime, scel
 
 # Sogou keeps user-authored dictionaries under the roaming profile and, on some
 # builds, under the install tree. Both are searched relative to the current user.
-SCAN_ROOTS = (
-    Path(os.environ.get("APPDATA", "")) / "SogouInput",
-    Path(os.environ.get("LOCALAPPDATA", "")) / "SogouInput",
-    Path(os.environ.get("USERPROFILE", "")) / "Documents" / "SogouInput",
-    Path(r"C:\Program Files (x86)\Sougoupinyin\SogouInput\Data"),
-    Path(r"C:\Program Files\Sougoupinyin\SogouInput\Data"),
+SCAN_ROOTS = tuple(
+    Path(value) / suffix
+    for variable, suffix in (
+        ("APPDATA", "SogouInput"), ("LOCALAPPDATA", "SogouInput"),
+        ("USERPROFILE", "Documents/SogouInput"), ("USERPROFILE", "Downloads"),
+        ("ProgramFiles", "SogouInput"), ("ProgramFiles(x86)", "SogouInput"),
+        ("ProgramFiles", "Sougoupinyin/SogouInput/Data"),
+        ("ProgramFiles(x86)", "Sougoupinyin/SogouInput/Data"),
+    ) if (value := os.environ.get(variable))
 )
 
 
@@ -38,46 +43,60 @@ def _configure_stdout() -> None:
                 pass
 
 
-def _collect(paths: list[Path]) -> list[Path]:
-    """Expand files and directories into a sorted list of .scel files."""
-    found: list[Path] = []
+def _collect(paths: list[str | Path]) -> tuple[list[Path], list[dict]]:
+    """Keep every missing/empty/unreadable input in the result ledger."""
+    found: dict[Path, Path] = {}
+    errors: list[dict] = []
     for raw in paths:
         path = Path(raw).expanduser()
-        if path.is_dir():
-            found.extend(sorted(path.rglob("*.scel")))
-        elif path.is_file():
-            found.append(path)
-        else:
-            print(f"跳过不存在的路径：{path}", file=sys.stderr)
-    seen: set[Path] = set()
-    unique: list[Path] = []
-    for item in found:
-        resolved = item.resolve()
-        if resolved not in seen:
-            seen.add(resolved)
-            unique.append(item)
-    return unique
+        try:
+            if path.is_dir():
+                items = []
+                def walk_error(error):
+                    errors.append({"source": str(error.filename), "status": "failed", "reason": str(error)})
+                for directory, _dirs, names in os.walk(path, onerror=walk_error):
+                    items.extend(Path(directory) / name for name in names if name.lower().endswith(".scel"))
+                items.sort()
+                if not items:
+                    errors.append({"source": str(path), "status": "failed", "reason": "目录内没有 .scel 文件"})
+            elif path.is_file():
+                items = [path]
+            else:
+                errors.append({"source": str(path), "status": "failed", "reason": "输入路径不存在"})
+                continue
+            for item in items:
+                found.setdefault(item.resolve(), item)
+        except OSError as error:
+            errors.append({"source": str(path), "status": "failed", "reason": str(error)})
+    return list(found.values()), errors
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
-    hits: list[Path] = []
-    for root in SCAN_ROOTS:
-        if not root or not Path(root).is_dir():
-            continue
-        print(f"搜索：{root}")
-        hits.extend(sorted(Path(root).rglob("*.scel")))
-
-    if not hits:
-        print("\n没有找到 .scel 文件。")
-        print("如果你是从搜狗词库官网下载的词库，直接用 convert 指定文件路径即可。")
-        return 1
-
-    print(f"\n找到 {len(hits)} 个词库：")
-    for item in hits:
-        size = item.stat().st_size
-        print(f"  {item}  ({size:,} 字节)")
-    return 0
-
+    roots = list(dict.fromkeys([*SCAN_ROOTS, *(Path(p).expanduser() for p in args.include)]))
+    existing = [root for root in roots if root.is_dir()]
+    hits, errors = _collect(existing)
+    # Empty default roots are coverage information, not failed explicit inputs.
+    errors = [item for item in errors if item["reason"] != "目录内没有 .scel 文件"]
+    for root in args.include:
+        if not Path(root).expanduser().is_dir():
+            errors.append({"source": root, "status": "failed", "reason": "额外扫描目录不存在或不是目录"})
+    code = 0 if hits and not errors else 1
+    report = {"schema_version": 1, "operation": "scan", "roots": [str(p) for p in roots],
+              "searched_roots": [str(p) for p in existing], "files": [str(p.resolve()) for p in hits],
+              "errors": errors, "exit_code": code,
+              "scope": "仅覆盖列出的目录；未发现不代表本机没有词库，未判断容器兼容性"}
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        for root in existing:
+            print(f"搜索：{root}")
+        print(f"找到 {len(hits)} 个 .scel 文件（尚未验证格式）：")
+        for item in hits:
+            print(f"  {item}")
+        for item in errors:
+            print(f"{item['source']}：{item['reason']}", file=sys.stderr)
+        print(report["scope"])
+    return code
 
 def cmd_info(args: argparse.Namespace) -> int:
     path = Path(args.file).expanduser()
@@ -110,74 +129,76 @@ def cmd_info(args: argparse.Namespace) -> int:
         print("警告      ：无")
 
     if args.preview and dictionary.entries:
-        print("\n前 20 条：")
+        print(f"\n前 {args.preview} 条：")
         for entry in dictionary.entries[: args.preview]:
             print(f"    {entry.word}\t{entry.pinyin}\t{entry.frequency}")
-    return 0
+    print(f"解析完整性：{'完整' if dictionary.complete else '部分恢复'}")
+    return 0 if dictionary.complete else 3
 
 
 def cmd_convert(args: argparse.Namespace) -> int:
-    files = _collect(args.inputs)
-    if not files:
-        print("没有可转换的 .scel 文件。", file=sys.stderr)
-        return 1
-
-    if args.name and len(files) > 1:
-        print("--name 只能用于单个文件。", file=sys.stderr)
+    files, records = _collect(args.inputs)
+    if (args.name or args.stdout) and (len(files) != 1 or records):
+        print("--name / --stdout 要求一个有效文件，且没有其他无效输入。", file=sys.stderr)
         return 2
-
+    if args.stdout and (args.json or args.dry_run):
+        print("--stdout 不能与 --json / --dry-run 一起使用。", file=sys.stderr)
+        return 2
     output_dir = Path(args.output).expanduser()
-    written: list[tuple[Path, str]] = []
-    failures = 0
-
-    for index, path in enumerate(files):
+    planned = []
+    for path in files:
+        record = {"source": str(path), "status": "failed", "written": False}
+        records.append(record)
         try:
             dictionary = scel.parse_file(path)
-        except (OSError, scel.ScelError) as error:
-            print(f"跳过 {path}：{error}", file=sys.stderr)
-            failures += 1
+            name = rime.name_for(dictionary, override=args.name)
+            destination = output_dir / f"{name}.dict.yaml"
+            record.update(name=name, destination=str(destination), entries=len(rime.dedupe(dictionary.entries)),
+                          parsed_entries=len(dictionary.entries), complete=dictionary.complete, warnings=dictionary.warnings)
+            if not dictionary.entries:
+                record["reason"] = "没有解析出词条"
+                continue
+            if not dictionary.complete and not args.allow_partial:
+                record.update(status="partial", reason="仅部分恢复；未写入，确认后可用 --allow-partial 导出")
+                continue
+            planned.append((dictionary, destination, record))
+        except (OSError, scel.ScelError, ValueError) as error:
+            record["reason"] = str(error)
+
+    # Compare identities case-insensitively, including on non-Windows hosts.
+    counts = Counter(record["name"].casefold() for _d, _p, record in planned)
+    for dictionary, destination, record in planned:
+        if counts[record["name"].casefold()] > 1:
+            record.update(status="conflict", reason="批内词典名冲突；请分别用 --name 重命名，--force 不会覆盖批内冲突")
             continue
-
-        if not dictionary.entries:
-            print(f"跳过 {path}：没有解析出词条", file=sys.stderr)
-            failures += 1
+        if not args.stdout and destination.exists() and not args.force:
+            record.update(status="conflict", reason="输出已存在；确认后可用 --force 替换")
             continue
+        try:
+            if args.stdout:
+                sys.stdout.write(rime.render(dictionary, record["name"], scale=args.scale, sort_by_weight=not args.no_sort))
+            elif not args.dry_run:
+                rime.write(dictionary, destination, record["name"], scale=args.scale,
+                           sort_by_weight=not args.no_sort, source_note=str(dictionary.path))
+                record["written"] = True
+            record["status"] = "partial" if not dictionary.complete else ("planned" if args.dry_run else "converted")
+        except (OSError, ValueError) as error:
+            record.update(status="failed", reason=str(error))
 
-        name = rime.name_for(dictionary, index=index, override=args.name)
-        destination = output_dir / f"{name}.dict.yaml"
-
-        if args.stdout:
-            sys.stdout.write(rime.render(dictionary, name, scale=args.scale, sort_by_weight=not args.no_sort))
-            continue
-
-        if destination.exists() and not args.force:
-            print(f"已存在，跳过（用 --force 覆盖）：{destination}", file=sys.stderr)
-            failures += 1
-            continue
-
-        rime.write(
-            dictionary,
-            destination,
-            name,
-            scale=args.scale,
-            sort_by_weight=not args.no_sort,
-            source_note=str(path),
-        )
-        written.append((destination, name))
-        print(f"✓ {path.name} → {destination}  ({len(dictionary.entries)} 条, 名称 {name})")
-
-        if dictionary.warnings:
-            print(f"  注意：{len(dictionary.warnings)} 条警告，用 info 查看详情", file=sys.stderr)
-
-    if not args.stdout:
-        print(f"\n完成：写入 {len(written)} 个文件，失败 {failures} 个。")
-        if written:
-            print("\n在 schema 里启用（import_tables 用词典名，不带扩展名）：")
-            print("  import_tables:")
-            for _destination, name in written:
-                print(f"    - {name}")
-    return 0 if failures == 0 else 1
-
+    summary = dict(Counter(record["status"] for record in records))
+    code = 1 if not records or any(r["status"] in {"failed", "conflict"} for r in records) else (3 if summary.get("partial") else 0)
+    report = {"schema_version": 1, "operation": "convert", "dry_run": args.dry_run,
+              "results": records, "summary": summary, "written_files": sum(bool(r.get("written")) for r in records), "exit_code": code}
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        stream = sys.stderr if args.stdout else sys.stdout
+        for record in records:
+            print(f"[{record['status']}] {record['source']}：{record.get('reason', record.get('destination', ''))}", file=stream)
+            for warning in record.get("warnings", []):
+                print(f"  注意：{warning}", file=stream)
+        print(f"完成：写入 {report['written_files']} 个文件；状态 {summary}；退出码 {code}", file=stream)
+    return code
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -188,6 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     scan = subparsers.add_parser("scan", help="查找本机的 .scel 词库")
+    scan.add_argument("--include", action="append", default=[], metavar="DIR", help="额外扫描目录，可重复指定")
+    scan.add_argument("--json", action="store_true", help="输出机器可读报告")
     scan.set_defaults(func=cmd_scan)
 
     info = subparsers.add_parser("info", help="查看一个 .scel 词库的元信息和词条")
@@ -208,6 +231,9 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--no-sort", action="store_true", help="保持词库原始顺序")
     convert.add_argument("--stdout", action="store_true", help="输出到标准输出，不写文件")
     convert.add_argument("--force", action="store_true", help="覆盖已存在的输出文件")
+    convert.add_argument("--allow-partial", action="store_true", help="允许导出恢复到的部分词条，仍返回退出码 3")
+    convert.add_argument("--dry-run", action="store_true", help="解析和检查冲突，但不写文件")
+    convert.add_argument("--json", action="store_true", help="输出逐文件 JSON 报告")
     convert.set_defaults(func=cmd_convert)
 
     return parser
@@ -217,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
     _configure_stdout()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "scale", 1) < 1:
+        parser.error("--scale 必须大于 0")
     return args.func(args)
 
 

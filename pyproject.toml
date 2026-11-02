@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scel2rime"
-version = "0.1.0"
+version = "0.2.0"
 description = "Convert your own Sogou .scel dictionaries into Rime .dict.yaml, offline and dependency-free."
 readme = "README.md"
 requires-python = ">=3.10"

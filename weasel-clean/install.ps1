@@ -1,162 +1,100 @@
-﻿<#
-.SYNOPSIS
-    Apply the scel2rime "clean" Rime configuration to Weasel (小狼毫).
-
-.DESCRIPTION
-    Copies the three .custom.yaml patches into the Rime user directory, then
-    generates `scel_merged.dict.yaml`, an aggregation dictionary that pulls the
-    stock `luna_pinyin_simp` together with any dictionaries you migrated with
-    `scel2rime convert`.
-
-    Every existing file is backed up first. Nothing is downloaded, nothing is
-    installed, and no Sogou file is read or written.
-
-.PARAMETER RimeUserDir
-    Rime user directory. Defaults to %APPDATA%\Rime.
-
-.PARAMETER From
-    Directory holding the .dict.yaml files produced by `scel2rime convert`.
-    Every *.dict.yaml in it is copied in and merged.
-
-.PARAMETER DryRun
-    Print what would change without touching anything.
-
-.EXAMPLE
-    .\install.ps1 -From ..\rime-dicts
-
-.EXAMPLE
-    .\install.ps1 -RimeUserDir D:\Rime -From ..\rime-dicts -DryRun
-#>
-
+# Install only after complete preflight; restore source files and build on failure.
 [CmdletBinding()]
 param(
     [string]$RimeUserDir = (Join-Path $env:APPDATA 'Rime'),
     [string]$From,
     [switch]$DryRun,
-    [switch]$Deploy
+    [switch]$Deploy,
+    [string]$WeaselRoot,
+    [ValidateRange(1,3600)][int]$TimeoutSeconds = 120,
+    [switch]$Json
 )
-
-$ErrorActionPreference = 'Stop'
-
-function Write-Step([string]$Message) { Write-Host "  $Message" }
-function Write-Head([string]$Message) { Write-Host "`n$Message" -ForegroundColor Cyan }
-
-function Write-Utf8NoBom([string]$Path, [string]$Content) {
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
-}
-
-$root = Split-Path -Parent $PSScriptRoot
-$rimeSource = Join-Path $PSScriptRoot 'rime'
-
-Write-Head 'scel2rime / weasel-clean'
-Write-Step "配置源目录 : $rimeSource"
-Write-Step "Rime 用户目录: $RimeUserDir"
-if ($From) { Write-Step "词库来源    : $From" }
-
-if (-not (Test-Path $RimeUserDir)) {
-    Write-Host "`n未找到 Rime 用户目录。" -ForegroundColor Yellow
-    Write-Host '先安装 Weasel（小狼毫），启动一次让它生成该目录，再运行本脚本。'
-    Write-Host '下载：https://github.com/rime/weasel/releases'
-    exit 1
-}
-
-# ---- 备份 ----------------------------------------------------------------
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupDir = Join-Path $RimeUserDir "backup-scel2rime-$stamp"
-$targets = @('default.custom.yaml', 'weasel.custom.yaml', 'luna_pinyin_simp.custom.yaml', 'scel_merged.dict.yaml')
-
-$existing = $targets | Where-Object { Test-Path (Join-Path $RimeUserDir $_) }
-if ($existing) {
-    Write-Head "备份现有文件 -> $backupDir"
-    if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $backupDir | Out-Null }
-    foreach ($name in $existing) {
-        Write-Step $name
-        if (-not $DryRun) { Copy-Item (Join-Path $RimeUserDir $name) (Join-Path $backupDir $name) -Force }
+. (Join-Path $PSScriptRoot 'common.ps1')
+$backup = $null; $operationLock = $null; $mutating = $false
+$report = [ordered]@{ schema_version=1; operation='install'; status='failed'; user_dir=$RimeUserDir; backup_dir=$null; changed_files=@(); compiled=$false; exit_code=1 }
+try {
+    $RimeUserDir = Resolve-Directory $RimeUserDir
+    $report.user_dir = $RimeUserDir
+    $payloads = @()
+    foreach ($name in @('default.custom.yaml','weasel.custom.yaml','luna_pinyin_simp.custom.yaml')) {
+        $source = Join-Path (Join-Path $PSScriptRoot 'rime') $name
+        Assert-PlainPath $source
+        $payloads += [pscustomobject]@{ Name=$name; Bytes=[IO.File]::ReadAllBytes($source) }
     }
-}
-
-# ---- 配置补丁 ------------------------------------------------------------
-Write-Head '写入配置补丁'
-foreach ($name in @('default.custom.yaml', 'weasel.custom.yaml', 'luna_pinyin_simp.custom.yaml')) {
-    $source = Join-Path $rimeSource $name
-    $destination = Join-Path $RimeUserDir $name
-    Write-Step "$name -> $destination"
-    if (-not $DryRun) { Copy-Item $source $destination -Force }
-}
-
-# ---- 迁移过来的词库 ------------------------------------------------------
-$merged = @('luna_pinyin')
-if ($From) {
-    if (-not (Test-Path $From)) {
-        Write-Host "`n词库目录不存在：$From" -ForegroundColor Yellow
-        Write-Host '先运行 scel2rime convert 生成 .dict.yaml，再用 -From 指向它。'
-        exit 1
-    }
-    $dicts = Get-ChildItem -Path $From -Filter '*.dict.yaml' -File
-    if (-not $dicts) {
-        Write-Host "`n$From 里没有 .dict.yaml 文件，只安装配置补丁。" -ForegroundColor Yellow
-    } else {
-        Write-Head '合并迁移词库'
+    $merged = @('luna_pinyin')
+    if ($From) {
+        $From = Resolve-Directory $From
+        if ($From.Equals($RimeUserDir,[StringComparison]::OrdinalIgnoreCase)) { throw '-From must be a separate export directory' }
+        $dicts = @(Get-ChildItem -LiteralPath $From -Filter '*.dict.yaml' -File | Sort-Object Name)
+        if (-not $dicts.Count) { throw 'No .dict.yaml files in -From; no changes made' }
         foreach ($dict in $dicts) {
-            $name = [System.IO.Path]::GetFileNameWithoutExtension($dict.Name)  # 去掉 .yaml
-            $name = [System.IO.Path]::GetFileNameWithoutExtension($name)       # 去掉 .dict
-            Write-Step "$($dict.Name) -> $name"
-            if (-not $DryRun) { Copy-Item $dict.FullName (Join-Path $RimeUserDir $dict.Name) -Force }
+            Assert-PlainPath $dict.FullName
+            $name = $dict.Name.Substring(0,$dict.Name.Length - '.dict.yaml'.Length)
+            if ($name -in @('scel_merged','luna_pinyin','cangjie5','stroke','terra_pinyin')) { throw "Reserved dictionary name: $name" }
+            $bytes = [IO.File]::ReadAllBytes($dict.FullName)
+            $text = (New-Object Text.UTF8Encoding($false,$true)).GetString($bytes).TrimStart([char]0xfeff)
+            $parts = ([regex]'(?m)^\.\.\.\s*\r?$').Split($text, 2)
+            if ($parts.Count -ne 2) { throw "Dictionary header terminator missing: $($dict.Name)" }
+            $matches = [regex]::Matches($parts[0], '(?m)^name:\s*([^\r\n]+)\r?$')
+            if ($matches.Count -ne 1) { throw "Exactly one dictionary name is required: $($dict.Name)" }
+            $value = $matches[0].Groups[1].Value.Trim()
+            if ($value.StartsWith('"')) { $declared = ConvertFrom-Json -InputObject $value }
+            elseif ($value.StartsWith("'") -and $value.EndsWith("'")) { $declared = $value.Substring(1,$value.Length-2).Replace("''", "'") }
+            elseif ($value -match '^[\p{L}\p{N}_.-]+$') { $declared = $value }
+            else { throw "Unsupported dictionary name syntax: $($dict.Name)" }
+            if ($declared -isnot [string] -or -not $name.Equals($declared,[StringComparison]::Ordinal)) { throw "Filename/header name mismatch: $($dict.Name)" }
+            $payloads += [pscustomobject]@{ Name=$dict.Name; Bytes=$bytes }
             $merged += $name
         }
     }
-}
-
-# ---- 聚合词典 ------------------------------------------------------------
-Write-Head '生成聚合词典 scel_merged.dict.yaml'
-$lines = @(
-    '# Generated by scel2rime/weasel-clean install.ps1',
-    '# Aggregates the stock luna_pinyin dictionary with the dictionaries you migrated.',
-    '# Re-run install.ps1 after adding more dictionaries.',
-    '---',
-    'name: scel_merged',
-    'version: "1"',
-    'sort: by_weight',
-    'use_preset_vocabulary: true',
-    'import_tables:'
-)
-foreach ($name in $merged) { $lines += "  - $name" }
-$lines += '...'
-$content = ($lines -join "`n") + "`n"
-
-Write-Step ('import_tables: ' + ($merged -join ', '))
-if (-not $DryRun) {
-    Write-Utf8NoBom (Join-Path $RimeUserDir 'scel_merged.dict.yaml') $content
-}
-
-# ---- 收尾 ----------------------------------------------------------------
-Write-Head '完成'
-if ($DryRun) {
-    Write-Host '这是 dry-run，没有写入任何文件。去掉 -DryRun 再跑一次。' -ForegroundColor Yellow
-    exit 0
-}
-
-if ($Deploy -and -not $DryRun) {
-    Write-Head '部署'
-    Write-Step 'WeaselDeployer /deploy 在部分机器上只发消息、不起部署线程，改用直接调 librime'
-    & (Join-Path $PSScriptRoot 'deploy.ps1') -FullCheck
-    $table = Join-Path $RimeUserDir 'build\scel_merged.table.bin'
-    if (Test-Path $table) {
-        Write-Step ("scel_merged.table.bin 已生成：" + [math]::Round((Get-Item $table).Length / 1MB, 1) + " MB")
-    } else {
-        Write-Host '部署结束了，但没找到 scel_merged.table.bin —— 检查 build 目录和 rime 日志' -ForegroundColor Yellow
+    $lines = @('# Generated by scel2rime; restore with the matching manifest.','---','name: scel_merged','version: "1"','sort: by_weight','use_preset_vocabulary: true','import_tables:')
+    foreach ($name in $merged) { $lines += '  - ' + (ConvertTo-Json -InputObject $name -Compress) }
+    $lines += '...'
+    $payloads += [pscustomobject]@{ Name='scel_merged.dict.yaml'; Bytes=[Text.Encoding]::UTF8.GetBytes(($lines -join "`n") + "`n") }
+    $seen = @{}
+    foreach ($payload in $payloads) {
+        if ($seen.ContainsKey($payload.Name)) { throw "Duplicate target: $($payload.Name)" }
+        $seen[$payload.Name]=$true
+        $target = Get-Target $RimeUserDir $payload.Name
+        if (Test-Path -LiteralPath $target -PathType Container) { throw "File target is a directory: $target" }
     }
+    if ($Deploy) { $WeaselRoot = Resolve-Weasel $WeaselRoot; Assert-PlainTree (Join-Path $RimeUserDir 'build') }
+    $report.changed_files = @($payloads | ForEach-Object { $_.Name })
+    if ($DryRun) {
+        $report.status='planned'; $report.exit_code=0
+    } else {
+        $operationLock = Enter-Operation $RimeUserDir
+        $targets = @($payloads | ForEach-Object { $_.Name })
+        if ($Deploy) { $targets += @('build','installation.yaml','user.yaml') }
+        $backup = New-Snapshot $RimeUserDir $targets
+        $report.backup_dir=$backup
+        $mutating=$true
+        foreach ($payload in $payloads) { [IO.File]::WriteAllBytes((Get-Target $RimeUserDir $payload.Name),$payload.Bytes) }
+        if ($Deploy) {
+            # Same-process nested invocation shares the installer lock; deploy handles its own build rollback.
+            $deployArgs = @{ UserDir=$RimeUserDir; WeaselRoot=$WeaselRoot; FullCheck=$true; TimeoutSeconds=$TimeoutSeconds; Json=$true }
+            $deploymentText = & (Join-Path $PSScriptRoot 'deploy.ps1') @deployArgs
+            $deployment = $deploymentText | ConvertFrom-Json
+            if ($deployment.exit_code -ne 0 -or $deployment.status -ne 'compiled') { throw "Deployment failed: $($deployment.error)" }
+            $report.compiled=$true
+            $report.deployment=$deployment
+        }
+        $report.status= if ($Deploy) { 'compiled' } else { 'installed' }
+        $report.exit_code=0
+    }
+} catch {
+    $report.error=$_.Exception.Message
+    if ($mutating -and $backup) {
+        try { Restore-Snapshot $backup; $report.status='rolled_back' }
+        catch { $report.status='rollback_failed'; $report.rollback_error=$_.Exception.Message }
+    }
+} finally { if ($operationLock) { $operationLock.Dispose() } }
+if ($Json) { $report | ConvertTo-Json -Depth 12 }
+else {
+    Write-Output ("Status: " + $report.status + "; target: " + $report.user_dir)
+    if ($backup) { Write-Output ("Backup: " + $backup) }
+    if ($report.Contains('error')) { Write-Output $report.error }
+    if ($report.status -eq 'installed') { Write-Output 'Files installed; compilation has not run. Use -Deploy to compile.' }
+    if ($report.status -eq 'compiled') { Write-Output 'Compilation verified; test typing and simplified/traditional switching in your input method.' }
 }
-Write-Host '现在重新部署：'
-Write-Host '  右键任务栏输入法图标 -> 重新部署（Deploy）'
-
-# Find the installer's own deployer rather than hardcoding a version.
-$deployer = Get-ChildItem 'C:\Program Files\Rime' -Recurse -Filter 'WeaselDeployer.exe' -ErrorAction SilentlyContinue |
-    Sort-Object FullName -Descending | Select-Object -First 1
-if ($deployer) {
-    Write-Host "  或运行：& `"$($deployer.FullName)`" /deploy"
-}
-
-Write-Host ''
-Write-Host "如果输入法异常，把 $backupDir 里的文件覆盖回去即可。" -ForegroundColor DarkGray
+exit $report.exit_code

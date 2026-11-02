@@ -1,94 +1,72 @@
 # weasel-clean
 
-一份给 [Weasel（小狼毫）](https://github.com/rime/weasel) 的配置包：装完就是干净的中文输入，没有皮肤商店、云端候选、浏览器组件、AI 联想。
+给已安装的 Weasel（小狼毫）应用本地配置与迁移词库。脚本不下载安装程序，不注册输入法，也不修改搜狗文件。
 
-**这是配置，不是软件。** 输入法本体是 Rime/Weasel，按 GPLv3 由上游发布；本目录只有 YAML 补丁和一个安装脚本，MIT 授权。安装脚本调用的是你已经装好的 Weasel，不下载、不打包、不修改它的任何二进制。
+## 前提与边界
 
-## 前提
+- Windows，Python 转换器需要 Python 3.10+；安装脚本需要 Windows PowerShell 5.1 或 PowerShell 7。
+- 先安装并启动一次 [Weasel](https://github.com/rime/weasel/releases)，建立 Rime 用户目录。
+- 配置会替换三份 `.custom.yaml`，不是与现有键位、皮肤、方案逐项合并。所有被替换文件都进入本次备份。
+- 对自定义位置显式传入 `-RimeUserDir` 和 `-WeaselRoot`。自动寻找只覆盖 Program Files 下的 Rime 安装目录。
+- 若输入法正在占用编译文件，部署可能失败并恢复。应先关闭占用，再重试；脚本不会强行结束输入法服务。
 
-先装 Weasel 并启动一次，让它生成用户目录 `%APPDATA%\Rime`。
-
-下载：<https://github.com/rime/weasel/releases>
-
-## 用法
+## 安装与预演
 
 ```powershell
-# 只装配置
+.\install.ps1 -From ..\rime-dicts -DryRun -Json
+.\install.ps1 -From ..\rime-dicts -Deploy -Json
+
+# 自定义位置；同一个目录会传给部署器
+.\install.ps1 -RimeUserDir D:\Rime -WeaselRoot D:\Apps\Weasel -From ..\rime-dicts -Deploy -Json
+
+# 只安装默认配置和基础聚合词典，不进行编译
 .\install.ps1
-
-# 连同 scel2rime 迁移过来的词库一起装，并立刻部署
-.\install.ps1 -From ..\rime-dicts -Deploy
-
-# 先看看会改什么
-.\install.ps1 -From ..\rime-dicts -DryRun
 ```
 
-脚本会做四件事：
+`-DryRun` 完成输入与命名检查，不创建备份、锁文件或任何配置。`-From` 不存在或为空、文件名与头部 name 不一致、含保留词典名时，预检失败，不改配置。保留名包括 `scel_merged` 和基础词典名。
 
-1. 把现有配置备份到 `%APPDATA%\Rime\backup-scel2rime-<时间戳>\`
-2. 写入三份 `.custom.yaml` 补丁
-3. 复制 `-From` 目录里的 `.dict.yaml`，并登记词典名
-4. 生成 `scel_merged.dict.yaml`，把官方 `luna_pinyin` 词典和你的词库聚合到一起
+安装器会：
 
-加 `-Deploy` 会顺手把部署也跑掉，并检查 `build\scel_merged.table.bin` 有没有真的生成。
+1. 读取并检查所有输入；准备配置、词典和聚合词典。
+2. 锁定本目录，备份所有将被覆盖的文件，记录哪些目标原本不存在。
+3. 校验备份 SHA-256，保存唯一的 `backup-scel2rime-时间-随机值/manifest.json`。
+4. 应用配置；可选编译。任何已捕获的写入或编译错误都会触发自动恢复。
 
-## 部署这一步为什么要单独写
+突发断电或安装进程被外部强杀，无法保证自动恢复完成；保留的清单支持下次手动恢复。
 
-`WeaselDeployer.exe /deploy` 做的事只是**给 WeaselServer 服务发消息**，真正的编译发生在服务里。在部分安装上（本项目实测 Weasel 0.17.4 + librime 1.13.1）那个部署线程起不来：命令返回、日志停在"加载 schema"之后就没了，`build\` 里一个文件都不更新。表面上"部署成功"，实际什么都没变——这是最难查的一类故障，因为配置文件看着完全正确。
-
-`deploy.ps1` 绕过服务，直接调 `rime.dll`：
-
-```
-RimeSetup -> RimeInitialize -> RimeStartMaintenance(full) -> Finalize
-```
-
-它按 [rime_api.h](https://github.com/rime/librime/blob/master/src/rime_api.h) 里的字段顺序构造 `RimeTraits`。这里有两个坑，都踩过：
-
-- `data_size` 必须是 `sizeof(Traits) - 4`。漏了它，librime 会把第一个字段的指针当成尺寸，**整份 traits 被忽略**，回退到进程工作目录——看起来部署成功，其实编译到了别的地方。
-- 字段顺序是 `... distribution_version, app_name, modules, min_log_level, log_dir, ...`。中间多塞一个不存在的字段，`RimeInitialize` 直接访问违例。
-
-单独用：
+## 部署与成功判定
 
 ```powershell
-.\deploy.ps1 -FullCheck     # 强制全量重建
-.\deploy.ps1                # 增量
+.\deploy.ps1 -UserDir D:\Rime -WeaselRoot D:\Apps\Weasel -TimeoutSeconds 120 -Json
 ```
 
-**验证部署是否真的生效**，看时间戳，不要看返回码：
+部署器会备份 `build`、`installation.yaml`、`user.yaml`，从空的 build 开始全量编译。`-FullCheck` 保留为兼容参数；现在每次都是全量编译，不以旧缓存作为成功证据。
+
+调用 `rime.dll` 的代码位于独立的 `deploy-worker.ps1` 进程。部署器等待进程退出、限制最长运行时间，检查本次原生日志是否有 ERROR/FATAL，再验证以下新产物非空：
+
+- `scel_merged.table.bin`
+- `luna_pinyin_simp.prism.bin`
+- `luna_pinyin_simp.schema.yaml`，且引用 `scel_merged`
+
+日志保存在本次部署备份目录。失败或超时恢复旧编译目录及上述元数据；由安装器调用时，还会恢复安装前的配置和词典。诊断日志和备份保留，不进行自动清理。脚本不备份或迁移个人学习数据库，不提供对任意第三方插件副作用的事务保证。
+
+JSON 状态：`planned` 预演通过；`installed` 文件已安装但未编译；`compiled` 新编译产物检查通过；`rolled_back` 失败且已恢复；`rollback_failed` 恢复未完成，需要按备份检查。退出码 0 表示该操作通过，1 表示失败。**`compiled` 不等于已验收实际候选、词频或简繁切换。**
+
+## 精确回滚
+
+只使用本次 JSON 返回的 `backup_dir`，不要把多个时间点的备份混在一起：
 
 ```powershell
-Get-ChildItem "$env:APPDATA\Rime\build\*.table.bin" | Select Name, LastWriteTime
+.\rollback.ps1 -BackupDir 'D:\Rime\backup-scel2rime-实际时间-实际编号' -DryRun -Json
+.\rollback.ps1 -BackupDir 'D:\Rime\backup-scel2rime-实际时间-实际编号' -Json
 ```
 
-## 装了什么
+回滚先校验整份备份，再恢复原文件并删除该次操作新增的受管文件。包含 build 的快照也恢复旧 build；只安装未编译的快照不涉及 build。回滚会覆盖该次操作之后对这些受管文件的编辑，请先保存需要保留的修改。恢复的是磁盘状态；正在运行的输入法可能需要重新加载。
 
-| 文件 | 作用 |
-|---|---|
-| `rime/default.custom.yaml` | 候选数 9、Shift 切英文时先上屏、光标键行为、默认中文简体 |
-| `rime/weasel.custom.yaml` | 一套纯色配色 `clean`、雅黑 14pt、横排、内嵌编码 |
-| `rime/luna_pinyin_simp.custom.yaml` | 词典指向 `scel_merged`，关掉编码提示，保留本地用户词库 |
-| `scel_merged.dict.yaml`（生成） | 聚合词典，`import_tables` 列出官方词典和你的词库 |
+## 配置内容
 
-## 它没有装什么
+候选数 9、横排、纯色配色、Shift 提交当前编码后切换英文、开启本地用户词库、使用 `luna_pinyin_simp`。迁移词典通过 `scel_merged` 聚合。此配置包不是独立输入法。
 
-- 没有皮肤商店，没有在线皮肤下载
-- 没有云端候选、云同步、账号
-- 没有内嵌浏览器
-- 没有 AI 联想、没有模型文件
-- 没有遥测
+## 验证范围
 
-这些不是"被关掉的开关"，是 librime 本身就没有的东西。上面三份补丁里没有任何一行涉及网络。
-
-## 回滚
-
-```powershell
-Copy-Item "$env:APPDATA\Rime\backup-scel2rime-*\*" "$env:APPDATA\Rime\" -Force
-```
-
-然后把 `scel_merged.dict.yaml` 删掉，重新部署。
-
-## 已知限制
-
-- 词典名默认用词库原名（通常是中文）。Rime 走 UTF-8 路径，中文名在 Windows 上正常；如果你的 librime 版本不认，用 `scel2rime convert --name ascii_name` 重转，再跑一遍本脚本。
-- 配色只做了一套。想换颜色改 `weasel.custom.yaml` 里的 `preset_color_schemes`，不需要联网。
-- 未在 Weasel 0.16 以下版本验证。
+参见 [验证记录](../docs/validation.md)。现有真实引擎验证基于 Weasel 0.17.4 / librime 1.13.1；不能据此推断其他版本全部兼容。Windows 10、其他架构、真实大词库仍需要单独验收。

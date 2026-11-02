@@ -9,7 +9,7 @@ lists: the only data it converts is the data you already own.
 from .rime import DEFAULT_WEIGHT_SCALE, name_for, render, sanitize_name, write
 from .scel import ScelDictionary, ScelError, WordEntry, parse, parse_file
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "DEFAULT_WEIGHT_SCALE",

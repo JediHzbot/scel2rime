@@ -1,125 +1,85 @@
-﻿# Deploy Rime by calling librime directly.
-#
-# Why this exists: `WeaselDeployer.exe /deploy` only posts a message to the
-# WeaselServer service. On some installs that service never starts the
-# deployment thread, so the command returns while nothing is compiled -- and the
-# schema keeps pointing at a dictionary that was never built.
-#
-# This script bypasses the service and drives librime itself:
-#   RimeSetup -> RimeInitialize -> RimeStartMaintenance(full) -> Finalize
-#
-# The traits struct mirrors `RimeTraits` from librime's rime_api.h. Getting it
-# wrong is subtle: a stale or mis-sized struct makes librime ignore every path
-# you set and fall back to the process working directory, which "succeeds"
-# while deploying into the wrong folder.
+# Compile in a child process; never accept stale build artifacts as success.
+[CmdletBinding()]
 param(
     [string]$WeaselRoot,
     [string]$UserDir = (Join-Path $env:APPDATA 'Rime'),
-    [switch]$FullCheck
+    [switch]$FullCheck,
+    [ValidateRange(1,3600)][int]$TimeoutSeconds = 120,
+    [switch]$Json
 )
-
-$ErrorActionPreference = 'Stop'
-
-if (-not $WeaselRoot) {
-    $candidate = Get-ChildItem 'C:\Program Files\Rime' -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like 'weasel-*' } |
-        Sort-Object Name -Descending |
-        Select-Object -First 1
-    if (-not $candidate) { throw 'Weasel not found under C:\Program Files\Rime' }
-    $WeaselRoot = $candidate.FullName
-}
-
-$dll = Join-Path $WeaselRoot 'rime.dll'
-if (-not (Test-Path $dll)) { throw "rime.dll not found in $WeaselRoot" }
-if (-not (Test-Path (Join-Path $WeaselRoot 'data'))) { throw "shared data directory missing in $WeaselRoot" }
-
-$env:PATH = "$WeaselRoot;" + $env:PATH
-
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class RimeNative
-{
-    // Field order and data_size follow librime/src/rime_api.h:
-    //   int data_size;
-    //   const char* shared_data_dir; const char* user_data_dir;
-    //   const char* distribution_name; const char* distribution_code_name;
-    //   const char* distribution_version; const char* app_name;
-    //   const char** modules; int min_log_level; const char* log_dir;
-    //   const char* prebuilt_data_dir; const char* staging_dir;
-    [StructLayout(LayoutKind.Sequential)]
-    public struct Traits
-    {
-        public int data_size;
-        public IntPtr shared_data_dir;
-        public IntPtr user_data_dir;
-        public IntPtr distribution_name;
-        public IntPtr distribution_code_name;
-        public IntPtr distribution_version;
-        public IntPtr app_name;
-        public IntPtr modules;
-        public int min_log_level;
-        public IntPtr log_dir;
-        public IntPtr prebuilt_data_dir;
-        public IntPtr staging_dir;
-    }
-
-    [DllImport("rime.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void RimeSetup(IntPtr traits);
-
-    [DllImport("rime.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void RimeInitialize(IntPtr traits);
-
-    [DllImport("rime.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern int RimeStartMaintenance(int fullCheck);
-
-    [DllImport("rime.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void RimeJoinMaintenanceThread();
-
-    [DllImport("rime.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void RimeFinalize();
-
-    // librime expects UTF-8. The ANSI marshaller would mangle Chinese paths.
-    public static IntPtr Utf8(string value)
-    {
-        if (value == null) return IntPtr.Zero;
-        byte[] bytes = Encoding.UTF8.GetBytes(value + "\0");
-        IntPtr pointer = Marshal.AllocHGlobal(bytes.Length);
-        Marshal.Copy(bytes, 0, pointer, bytes.Length);
-        return pointer;
-    }
-}
-'@
-
-$traits = New-Object RimeNative+Traits
-$size = [Runtime.InteropServices.Marshal]::SizeOf([type][RimeNative+Traits])
-# RIME_STRUCT_INIT: data_size = sizeof(Traits) - sizeof(data_size)
-$traits.data_size              = $size - 4
-$traits.shared_data_dir        = [RimeNative]::Utf8((Join-Path $WeaselRoot 'data'))
-$traits.user_data_dir          = [RimeNative]::Utf8($UserDir)
-$traits.distribution_name      = [RimeNative]::Utf8('Weasel')
-$traits.distribution_code_name = [RimeNative]::Utf8('weasel')
-$version = (Split-Path $WeaselRoot -Leaf) -replace '^weasel-', ''
-$traits.distribution_version   = [RimeNative]::Utf8($version)
-$traits.app_name               = [RimeNative]::Utf8('rime.weasel')
-$traits.modules                = [IntPtr]::Zero
-$traits.min_log_level          = 0
-
-$pinned = [Runtime.InteropServices.Marshal]::AllocHGlobal($size)
-[Runtime.InteropServices.Marshal]::StructureToPtr($traits, $pinned, $false)
-
+. (Join-Path $PSScriptRoot 'common.ps1')
+$inheritedLock = Get-Variable -Name operationLock -Scope 1 -ValueOnly -ErrorAction SilentlyContinue
+$operationLock=$null; $backup=$null; $mutating=$false; $process=$null
+$report=[ordered]@{ schema_version=1; operation='deploy'; status='failed'; user_dir=$UserDir; backup_dir=$null; exit_code=1 }
 try {
-    [RimeNative]::RimeSetup($pinned)
-    [RimeNative]::RimeInitialize($pinned)
-    $full = if ($FullCheck) { 1 } else { 0 }
-    $started = [RimeNative]::RimeStartMaintenance($full)
-    if ($started -ne 0) { [RimeNative]::RimeJoinMaintenanceThread() }
-    [RimeNative]::RimeFinalize()
+    $UserDir=Resolve-Directory $UserDir
+    $WeaselRoot=Resolve-Weasel $WeaselRoot
+    $report.user_dir=$UserDir
+    foreach ($name in @('scel_merged.dict.yaml','luna_pinyin_simp.custom.yaml')) {
+        $path=Get-Target $UserDir $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required source not found: $name" }
+    }
+    if ($inheritedLock -isnot [IO.FileStream] -or -not $inheritedLock.CanWrite -or -not $inheritedLock.Name.Equals((Join-Path $UserDir '.scel2rime.lock'),[StringComparison]::OrdinalIgnoreCase)) {
+        $operationLock=Enter-Operation $UserDir
+    }
+    $backup=New-Snapshot $UserDir @('build','installation.yaml','user.yaml')
+    $report.backup_dir=$backup
+    $mutating=$true
+    Remove-ManagedTarget $UserDir 'build'
+    New-Item -ItemType Directory -Path (Join-Path $UserDir 'build') | Out-Null
+    $worker=Join-Path $PSScriptRoot 'deploy-worker.ps1'
+    $logDir=Join-Path $backup 'native-logs'
+    New-Item -ItemType Directory -Path $logDir | Out-Null
+    $start=New-Object Diagnostics.ProcessStartInfo
+    $start.FileName=(Get-Process -Id $PID).Path
+    $start.UseShellExecute=$false
+    $start.CreateNoWindow=$true
+    $start.RedirectStandardOutput=$true
+    $start.RedirectStandardError=$true
+    $start.WorkingDirectory=$UserDir
+    $start.Arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $worker + '" -WeaselRoot "' + $WeaselRoot + '" -UserDir "' + $UserDir + '" -LogDir "' + $logDir + '"'
+    $process=New-Object Diagnostics.Process
+    $process.StartInfo=$start
+    $null=$process.Start()
+    $stdoutTask=$process.StandardOutput.ReadToEndAsync()
+    $stderrTask=$process.StandardError.ReadToEndAsync()
+    $finished=$process.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $finished) {
+        $process.Kill()
+        $process.WaitForExit()
+    }
+    Write-Utf8 (Join-Path $backup 'worker.stdout.log') $stdoutTask.GetAwaiter().GetResult()
+    Write-Utf8 (Join-Path $backup 'worker.stderr.log') $stderrTask.GetAwaiter().GetResult()
+    if (-not $finished) { throw "Deployment timed out after $TimeoutSeconds seconds; worker terminated" }
+    if ($process.ExitCode -ne 0) { throw "Worker exited $($process.ExitCode); see logs in $backup" }
+    $nativeErrors=@(Get-ChildItem -LiteralPath $logDir -File | Where-Object { $_.Name -match '\.(ERROR|FATAL)\.' -and $_.Length -gt 0 })
+    if ($nativeErrors.Count) { throw "Native compiler reported errors; see $logDir" }
+    $artifacts=@()
+    foreach ($name in @('scel_merged.table.bin','luna_pinyin_simp.prism.bin','luna_pinyin_simp.schema.yaml')) {
+        $path=Join-Path (Join-Path $UserDir 'build') $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) { throw "Fresh artifact missing/empty: $name" }
+        $item=Get-Item -LiteralPath $path
+        $artifacts += [pscustomobject]@{ name=$name; bytes=$item.Length; sha256=(Get-FileDigest $path) }
+    }
+    $schema=Get-Content -LiteralPath (Join-Path $UserDir 'build\luna_pinyin_simp.schema.yaml') -Raw -Encoding UTF8
+    if ($schema -notmatch '(?m)^\s+dictionary:\s*["'']?scel_merged["'']?\s*$') { throw 'Compiled schema does not reference scel_merged' }
+    $report.artifacts=$artifacts
+    $report.status='compiled'; $report.exit_code=0
+    $report.validation='Fresh compilation artifacts checked; typing and candidate behavior require an input-method test.'
+} catch {
+    $report.error=$_.Exception.Message
+    if ($mutating -and $backup) {
+        try { Restore-Snapshot $backup; $report.status='rolled_back' }
+        catch { $report.status='rollback_failed'; $report.rollback_error=$_.Exception.Message }
+    }
+} finally {
+    if ($process) { $process.Dispose() }
+    if ($operationLock) { $operationLock.Dispose() }
 }
-finally {
-    [Runtime.InteropServices.Marshal]::FreeHGlobal($pinned)
+if ($Json) { $report | ConvertTo-Json -Depth 8 }
+else {
+    Write-Output ("Status: " + $report.status + "; target: " + $report.user_dir)
+    if ($report.Contains('error')) { Write-Output $report.error }
+    if ($report.Contains('validation')) { Write-Output $report.validation }
 }
-
-Write-Host "deployed: $UserDir"
+exit $report.exit_code
