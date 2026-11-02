@@ -6,7 +6,7 @@
 
 | 检查 | 结果 |
 |---|---|
-| Python 完整测试 `python -B -m unittest discover -s tests -v` | 43 项全部通过 |
+| Python 完整测试 `python -B -m unittest discover -s tests -v` | 44 项全部通过（v0.2.1） |
 | Windows PowerShell 5.1 安装集成测试 | 11 项全部通过 |
 | PowerShell 脚本语法检查 | 通过 |
 | `git diff --check` | 通过 |
@@ -16,6 +16,10 @@
 | 两次真实编译后的精确回滚 | 全部本次新增受管文件、build 和部署元数据均已移除 |
 
 真实编译测试使用全新隔离用户目录与两条合成词条。产生非空的 `scel_merged.table.bin`（13,018,420 字节）、方案 prism 和方案 YAML，并检查方案指向 `scel_merged`。未修改日常输入法配置，未停止或重启输入法服务。
+
+## v0.2.1 安装验证补充
+
+发现并移除 `pyproject.toml` 的 UTF-8 BOM 后，标准 TOML 解析通过。从独立发布源码离线构建 wheel，并安装到隔离目录，CLI 返回 `scel2rime 0.2.1`。新增包元数据回归测试，完整测试集为 44 项。未向系统 Python 环境安装本项目。
 
 ## 回归覆盖
 
